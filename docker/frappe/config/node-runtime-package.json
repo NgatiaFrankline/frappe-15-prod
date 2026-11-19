@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "dependencies": {
+    "@redis/client": "1.5.12",
+    "cookie": "0.4.2",
+    "socket.io": "4.7.2",
+    "superagent": "8.1.2"
+  }
+}

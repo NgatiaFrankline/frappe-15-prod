@@ -1,0 +1,10 @@
+.claude
+.idea
+.env
+db
+/redis
+workspace
+bench-data
+frappe-data
+logs
+

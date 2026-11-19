@@ -1,0 +1,174 @@
+# Production-oriented Frappe/Helpdesk services.
+# Build and publish an immutable image containing the pinned Frappe and app
+# sources before deploying.
+# Terminate TLS in a host reverse proxy and route requests to
+# 127.0.0.1:${FRONTEND_EXT_HTTP_PORT:-8000}; Supervisor runs the Frappe processes and frontend.
+# Required values are documented beside their Compose interpolations below.
+# Container settings can be configured in the deployment .env file.
+x-mariadb-specs: &mariadb-specs
+  restart: unless-stopped
+  healthcheck:
+    test: [ "CMD", "healthcheck.sh", "--connect", "--innodb_initialized" ]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 30s
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "5"
+  security_opt:
+    - no-new-privileges:true
+---
+x-redis-common: &redis-common
+  build:
+    context: ./docker/redis
+    dockerfile: Dockerfile
+    target: redis
+  restart: unless-stopped
+  healthcheck:
+    test: [ "CMD", "redis-cli", "ping" ]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "5"
+  security_opt:
+    - no-new-privileges:true
+---
+x-frappe-image: &frappe-image
+  restart: unless-stopped
+  build:
+    context: ./docker/frappe
+    dockerfile: Dockerfile
+    target: frappe
+x-frappe-common: &frappe-common
+  init: true
+  restart: unless-stopped
+  working_dir: /home/frappe/frappe-bench
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "5"
+  security_opt:
+    - no-new-privileges:true
+x-frappe-environment: &frappe-environment
+  # Site, timezone, and service connection settings.
+  TZ: ${TZ:-Africa/Nairobi}
+  SITE_NAME: ${SITE_NAME:?Set SITE_NAME in the deployment environment}
+  SITE_DB_NAME: ${SITE_DB_NAME:?Set SITE_DB_NAME in the deployment environment}
+  SITE_DB_PASSWORD: ${SITE_DB_PASSWORD:?Set SITE_DB_PASSWORD in the deployment environment}
+  FRAPPE_SITE_NAME_HEADER: ${SITE_NAME}
+  DB_HOST: ${DB_HOST:?Set DB_HOST in the deployment environment}
+  DB_PORT: "${DB_PORT:?Set DB_PORT in the deployment environment}"
+  DB_ROOT_USER: ${DB_ROOT_USER:-root}
+  DB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in the deployment environment}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the deployment environment}
+  REDIS_CACHE_HOST: ${REDIS_CACHE_HOST:?Set REDIS_CACHE_HOST in the deployment environment}
+  REDIS_CACHE_PORT: "${REDIS_CACHE_PORT:?Set REDIS_CACHE_PORT in the deployment environment}"
+  REDIS_QUEUE_HOST: ${REDIS_QUEUE_HOST:?Set REDIS_QUEUE_HOST in the deployment environment}
+  REDIS_QUEUE_PORT: "${REDIS_QUEUE_PORT:?Set REDIS_QUEUE_PORT in the deployment environment}"
+  # Internal image paths and runtime mode.
+  SCRIPT_SOURCE: /scripts
+  ENV: prod
+  BUILD_ENV: docker
+  BENCH_DIR: /home/frappe/frappe-bench
+  GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+  GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
+  GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+  # Internal Frappé service addresses and Nginx proxy settings.
+  BACKEND_URL: http://127.0.0.1:8000
+  QUEUE_BACKEND_URL: http://frappe:8000
+  SOCKETIO: 127.0.0.1:9000
+  NGINX_LISTEN_PORT: "8080"
+  UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+  UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+  UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+  PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+  CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+  # Custom app refresh, backup schedule, and startup dependency/readiness settings.
+  REFRESH_CODEBASE_APPS: "${REFRESH_CODEBASE_APPS}"
+  BACKUP_CRON_SCHEDULE: "${BACKUP_CRON_SCHEDULE}"
+  BACKUP_DIR: /backup
+  DEPENDENCIES_STARTUP_TIMEOUT: "${DEPENDENCIES_STARTUP_TIMEOUT:-180}"
+  BACKEND_STARTUP_TIMEOUT: "${BACKEND_STARTUP_TIMEOUT:-180}"
+  WEBSOCKET_STARTUP_TIMEOUT: "${WEBSOCKET_STARTUP_TIMEOUT:-180}"
+x-frappe-volumes: &frappe-volumes
+  # Keep SSH credentials available only to manual Git operations in this service.
+  volumes:
+    - ./frappe-data/frappe-bench:/home/frappe/frappe-bench
+    - ./frappe-data/backup:/backup
+    - ./frappe-data/archive:/archive
+    - ./frappe-data/logs:/logs
+    - ./conf/frappe/benchinit_commands.conf:/conf/benchinit_commands.conf:ro
+    - ~/.ssh/config:/home/frappe/.ssh/config:ro
+    - ~/.ssh/my_git_key:/home/frappe/.ssh/my_git_key:ro
+    - ~/.ssh/my_git_key.pub:/home/frappe/.ssh/my_git_key.pub:ro
+---
+x-network: &network
+  networks:
+    - frappe-prod-network
+---
+services:
+  mariadb-db:
+    container_name: mariadb-db
+    image: mariadb:11.8.8
+    <<: [*mariadb-specs,*network]
+    volumes:
+      - ./db/prod:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed # Temporary fix for Database 10.6
+      - --default-time-zone=+03:00
+      - --innodb-buffer-pool-size=1GB
+      - --innodb-log-file-size=1G
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in the deployment environment}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in the deployment environment}
+      MARIADB_AUTO_UPGRADE: 1
+  redis-cache:
+    container_name: redis-cache
+    <<: [*redis-common,*network]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+  redis-queue:
+    container_name: redis-queue
+    <<: [*redis-common,*network]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+  frappe:
+    container_name: frappe
+    <<: [*frappe-image,*frappe-common,*frappe-volumes,*network]
+    command: ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
+    environment:
+      <<: *frappe-environment
+    ports:
+      - "${FRONTEND_EXT_HTTP_PORT:-8000}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/method/ping | grep -Eq '^[234]'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+  queue-long:
+    container_name: queue-long
+    <<: [*frappe-image,*frappe-common,*frappe-volumes,*network]
+    environment:
+      <<: *frappe-environment
+    command: ["bench", "worker", "--queue", "long,default"]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '[b]ench worker' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  frappe-prod-network:
+    name: frappe-prod-network
+    driver: bridge
